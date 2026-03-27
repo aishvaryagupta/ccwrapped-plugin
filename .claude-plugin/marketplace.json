@@ -1,0 +1,9 @@
+{
+  "plugins": [
+    {
+      "name": "ccwrapped",
+      "description": "Auto-sync your Claude Code usage stats to ccwrapped.dev",
+      "path": "."
+    }
+  ]
+}
