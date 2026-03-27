@@ -1,9 +1,23 @@
 {
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "ccwrapped-marketplace",
+  "owner": {
+    "name": "aishvaryagupta",
+    "email": "aishvarya0502@gmail.com"
+  },
   "plugins": [
     {
       "name": "ccwrapped",
       "description": "Auto-sync your Claude Code usage stats to ccwrapped.dev",
-      "path": "."
+      "version": "0.1.0",
+      "author": {
+        "name": "aishvaryagupta",
+        "email": "aishvarya0502@gmail.com"
+      },
+      "source": "./",
+      "category": "productivity",
+      "homepage": "https://ccwrapped.dev",
+      "tags": ["stats", "usage", "sync", "leaderboard"]
     }
   ]
 }
