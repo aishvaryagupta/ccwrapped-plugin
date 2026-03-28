@@ -5787,7 +5787,7 @@ var MAX_TOTAL_TOKENS_PER_DAY = 15e6;
 var MAX_COST_USD_PER_DAY = 50;
 var MIN_COST_USD_PER_DAY = 0;
 var MAX_BACKFILL_DAYS = 30;
-var SCHEMA_VERSION = 1;
+var SCHEMA_VERSION = 2;
 var CLIENT_VERSION = "0.1.0";
 var CONFIG_DIR_NAME = "ccwrapped";
 var STATE_FILE_NAME = "state.json";
@@ -6212,6 +6212,16 @@ function safeParse(schema, input, config$1) {
 var ModelNameSchema = pipe(string(), minLength(1), brand("ModelName"));
 var DailyDateSchema = pipe(string(), regex(/^\d{4}-\d{2}-\d{2}$/), brand("DailyDate"));
 var SessionIdSchema = pipe(string(), minLength(1), brand("SessionId"));
+var ContentBlockSchema = object({
+  type: string(),
+  name: optional(string()),
+  input: optional(object({
+    file_path: optional(string()),
+    content: optional(string()),
+    old_string: optional(string()),
+    new_string: optional(string())
+  }))
+});
 var UsageEntrySchema = object({
   sessionId: optional(string()),
   timestamp: pipe(string(), minLength(10)),
@@ -6219,6 +6229,7 @@ var UsageEntrySchema = object({
   message: object({
     id: optional(string()),
     model: optional(string()),
+    content: optional(array(ContentBlockSchema)),
     usage: object({
       input_tokens: number(),
       output_tokens: number(),
@@ -6234,6 +6245,10 @@ var ModelBreakdownSchema = object({
   cacheCreationTokens: pipe(number(), integer(), minValue(0)),
   cacheReadTokens: pipe(number(), integer(), minValue(0))
 });
+var ToolCountSchema = object({
+  toolName: string(),
+  count: pipe(number(), integer(), minValue(0))
+});
 var DaySummarySchema = object({
   date: pipe(string(), regex(/^\d{4}-\d{2}-\d{2}$/)),
   inputTokens: pipe(number(), integer(), minValue(0)),
@@ -6243,7 +6258,10 @@ var DaySummarySchema = object({
   costUSD: number(),
   sessionCount: pipe(number(), integer(), minValue(0)),
   projectCount: pipe(number(), integer(), minValue(0)),
-  modelBreakdowns: array(ModelBreakdownSchema)
+  modelBreakdowns: array(ModelBreakdownSchema),
+  toolCounts: optional(array(ToolCountSchema)),
+  filesTouched: optional(pipe(number(), integer(), minValue(0))),
+  linesWritten: optional(pipe(number(), integer(), minValue(0)))
 });
 var SyncPayloadSchema = object({
   schema_version: pipe(number(), integer()),
@@ -6278,6 +6296,33 @@ function extractDateUTC(isoTimestamp) {
   }
   return null;
 }
+var FILE_PATH_TOOLS = /* @__PURE__ */ new Set(["Read", "Write", "Edit"]);
+function extractToolMetrics(content) {
+  if (!content || content.length === 0)
+    return null;
+  const toolCounts = {};
+  const files = /* @__PURE__ */ new Set();
+  let linesWritten = 0;
+  for (const block of content) {
+    if (block.type !== "tool_use" || !block.name)
+      continue;
+    toolCounts[block.name] = (toolCounts[block.name] ?? 0) + 1;
+    if (FILE_PATH_TOOLS.has(block.name) && block.input?.file_path) {
+      files.add(block.input.file_path);
+    }
+    if (block.name === "Write" && block.input?.content) {
+      linesWritten += block.input.content.split("\n").length;
+    }
+    if (block.name === "Edit" && block.input?.new_string) {
+      const newLines = block.input.new_string.split("\n").length;
+      const oldLines = block.input.old_string?.split("\n").length ?? 0;
+      linesWritten += Math.max(0, newLines - oldLines);
+    }
+  }
+  if (Object.keys(toolCounts).length === 0)
+    return null;
+  return { toolCounts, filesTouched: [...files], linesWritten };
+}
 async function parseTranscriptFile(filePath) {
   const entries = [];
   const seen = /* @__PURE__ */ new Set();
@@ -6307,6 +6352,7 @@ async function parseTranscriptFile(filePath) {
     if (!date)
       continue;
     const usage = entry.message.usage;
+    const toolMetrics = extractToolMetrics(entry.message.content);
     entries.push({
       timestamp: new Date(entry.timestamp),
       date,
@@ -6319,7 +6365,10 @@ async function parseTranscriptFile(filePath) {
         cacheCreationInputTokens: usage.cache_creation_input_tokens ?? 0,
         cacheReadInputTokens: usage.cache_read_input_tokens ?? 0
       },
-      dedupeKey
+      dedupeKey,
+      toolCounts: toolMetrics?.toolCounts ?? null,
+      filesTouched: toolMetrics?.filesTouched ?? null,
+      linesWritten: toolMetrics?.linesWritten ?? null
     });
   }
   return entries;
@@ -6405,6 +6454,9 @@ function buildSyncPayload(entries, machineId, clientVersion, livePricing) {
     let unknownSessionCount = 0;
     const projects = /* @__PURE__ */ new Set();
     const modelAgg = /* @__PURE__ */ new Map();
+    const dayToolCounts = /* @__PURE__ */ new Map();
+    const dayFiles = /* @__PURE__ */ new Set();
+    let dayLinesWritten = 0;
     for (const entry of dayEntries) {
       inputTokens += entry.usage.inputTokens;
       outputTokens += entry.usage.outputTokens;
@@ -6433,6 +6485,18 @@ function buildSyncPayload(entries, machineId, clientVersion, livePricing) {
           });
         }
       }
+      if (entry.toolCounts) {
+        for (const [tool, count] of Object.entries(entry.toolCounts)) {
+          dayToolCounts.set(tool, (dayToolCounts.get(tool) ?? 0) + count);
+        }
+      }
+      if (entry.filesTouched) {
+        for (const fp of entry.filesTouched)
+          dayFiles.add(fp);
+      }
+      if (entry.linesWritten != null) {
+        dayLinesWritten += entry.linesWritten;
+      }
     }
     const modelBreakdowns = [...modelAgg.entries()].map(([modelName, agg]) => ({
       modelName,
@@ -6450,7 +6514,12 @@ function buildSyncPayload(entries, machineId, clientVersion, livePricing) {
       costUSD: Math.round(costUSD * 1e4) / 1e4,
       sessionCount: sessions.size + unknownSessionCount,
       projectCount: projects.size,
-      modelBreakdowns
+      modelBreakdowns,
+      ...dayToolCounts.size > 0 && {
+        toolCounts: [...dayToolCounts.entries()].map(([toolName, count]) => ({ toolName, count })).sort((a, b) => b.count - a.count)
+      },
+      ...dayFiles.size > 0 && { filesTouched: dayFiles.size },
+      ...dayLinesWritten > 0 && { linesWritten: dayLinesWritten }
     });
   }
   days.sort((a, b) => a.date.localeCompare(b.date));
